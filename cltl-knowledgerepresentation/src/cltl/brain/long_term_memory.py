@@ -133,6 +133,8 @@ class LongTermMemory(BasicBrain):
             # Check how many items of the same type as subject and complement we have
             entity_novelty = self.thought_generator.fill_entity_novelty(capsule['triple'].subject.id,
                                                                         capsule['triple'].complement.id)
+            # Entity similarity is an alternative to entity novelty
+            entity_similarity = entity_novelty
 
             # Find any overlaps
             overlaps = self.thought_generator.get_overlaps(capsule)
@@ -155,7 +157,8 @@ class LongTermMemory(BasicBrain):
             trust = self.trust_calculator.get_trust(capsule['author'])
 
             # Create JSON output
-            thoughts = Thoughts(statement_novelty, entity_novelty, negation_conflicts, cardinality_conflict,
+            thoughts = Thoughts(statement_novelty, entity_novelty, entity_similarity,
+                                negation_conflicts, cardinality_conflict,
                                 subject_gaps, complement_gaps, overlaps, trust)
             output = {'response': code, 'statement': capsule, 'thoughts': thoughts}
 

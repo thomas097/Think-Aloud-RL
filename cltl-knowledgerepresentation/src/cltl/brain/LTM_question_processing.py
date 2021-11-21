@@ -20,7 +20,6 @@ def create_query(self, utterance):
                                ?g gaf:denotedBy ?m . 
                                ?m grasp:wasAttributedTo ?author . 
                                ?author rdfs:label ?authorlabel .
-
                                ?m grasp:hasAttribution ?att .
                                
                                OPTIONAL {
@@ -28,34 +27,30 @@ def create_query(self, utterance):
                                ?certainty rdf:type graspf:CertaintyValue .
                                ?certainty rdfs:label ?certaintyValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?polarity .
                                ?polarity rdf:type graspf:PolarityValue .
                                ?polarity rdfs:label ?polarityValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?temporal .
                                ?temporal rdf:type graspf:TemporalValue .
                                ?temporal rdfs:label ?temporalValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?emotion .
                                ?emotion rdf:type graspe:EmotionValue .
                                ?emotion rdfs:label ?emotionValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?sentiment .
                                ?sentiment rdf:type grasps:SentimentValue .
                                ?sentiment rdfs:label ?sentimentValue .
                                }
                            }
-                   """ % (utterance['predicate']['type'],
+                   """ % (utterance['predicate']['label'],
                           utterance['object']['label'],
-                          utterance['predicate']['type'])
+                          utterance['predicate']['label'])
 
     # Query complement
     elif utterance['object']['label'] is None or utterance['object']['label'].lower() in empty:
@@ -71,7 +66,6 @@ def create_query(self, utterance):
                                ?g gaf:denotedBy ?m . 
                                ?m grasp:wasAttributedTo ?author . 
                                ?author rdfs:label ?authorlabel .
-
                                ?m grasp:hasAttribution ?att .
                                
                                OPTIONAL {
@@ -79,34 +73,30 @@ def create_query(self, utterance):
                                ?certainty rdf:type graspf:CertaintyValue .
                                ?certainty rdfs:label ?certaintyValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?polarity .
                                ?polarity rdf:type graspf:PolarityValue .
                                ?polarity rdfs:label ?polarityValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?temporal .
                                ?temporal rdf:type graspf:TemporalValue .
                                ?temporal rdfs:label ?temporalValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?emotion .
                                ?emotion rdf:type graspe:EmotionValue .
                                ?emotion rdfs:label ?emotionValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?sentiment .
                                ?sentiment rdf:type grasps:SentimentValue .
                                ?sentiment rdfs:label ?sentimentValue .
                                }
                            }
-                   """ % (utterance['predicate']['type'],
+                   """ % (utterance['predicate']['label'],
                           utterance['subject']['label'],
-                          utterance['predicate']['type'])
+                          utterance['predicate']['label'])
 
     # Query existence
     else:
@@ -122,7 +112,6 @@ def create_query(self, utterance):
                                ?g gaf:denotedBy ?m . 
                                ?m grasp:wasAttributedTo ?author . 
                                ?author rdfs:label ?authorlabel .
-
                                ?m grasp:hasAttribution ?att .
                                
                                OPTIONAL {
@@ -130,35 +119,31 @@ def create_query(self, utterance):
                                ?certainty rdf:type graspf:CertaintyValue .
                                ?certainty rdfs:label ?certaintyValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?polarity .
                                ?polarity rdf:type graspf:PolarityValue .
                                ?polarity rdfs:label ?polarityValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?temporal .
                                ?temporal rdf:type graspf:TemporalValue .
                                ?temporal rdfs:label ?temporalValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?emotion .
                                ?emotion rdf:type graspe:EmotionValue .
                                ?emotion rdfs:label ?emotionValue .
                                }
-
                                OPTIONAL {
                                ?att rdf:value ?sentiment .
                                ?sentiment rdf:type grasps:SentimentValue .
                                ?sentiment rdfs:label ?sentimentValue .
                                }
                            }
-                   """ % (utterance['predicate']['type'],
+                   """ % (utterance['predicate']['label'],
                           utterance['subject']['label'],
                           utterance['object']['label'],
-                          utterance['predicate']['type'])
+                          utterance['predicate']['label'])
 
     query = self.query_prefixes + query
 
