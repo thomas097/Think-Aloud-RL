@@ -1,4 +1,4 @@
-""" Filename:     thought_replier.py
+""" Filename:     RL_replier.py
     Author(s):    Thomas Bellucci
     Description:  Modified LenkaReplier for use in the RLChatbot. The replier
                   takes out the Thought selection step and only selects among
@@ -7,7 +7,9 @@
     Date created: Nov. 11th, 2021
 """
 
+from pattern.text.en import singularize
 import random
+from itertools import permutations
 from pprint import pprint
 import numpy as np
 
@@ -15,96 +17,529 @@ from cltl.combot.backend.utils.casefolding import casefold_text, casefold_capsul
 from cltl.reply_generation.api import BasicReplier
 from cltl.reply_generation.data.sentences import NEW_KNOWLEDGE, EXISTING_KNOWLEDGE, \
      CONFLICTING_KNOWLEDGE, CURIOSITY, HAPPY, TRUST, NO_TRUST, NO_ANSWER
-from cltl.reply_generation.utils.helper_functions import lexicon_lookup
+from cltl.reply_generation.utils.helper_functions import lexicon_lookup, thought_types_from_brain
 
-
-class ThoughtSelector:
-    def __init__(self):
-        # Import stopwords
-        with open('resources/stopwords.txt', 'r', encoding='utf-8') as file:
-            self.__stopwords = set([w.strip() for w in file])
-
-        # Import word probability table
-        self.__word_probs = dict()
-        with open('resources/word_probs.txt', 'r', encoding='utf-8') as file:
-            for line in file:
-                word, prob = line.strip().split(" ")
-                self.__word_probs[word] = float(prob)
-                
-
-    def __get_entities__(self, item):
-        """ Recursively extracts the entities.predicates mentioned in
-            a nested Thought dict.
-
-            params:
-            dict item: an iterable object of sorts (e.g. dict, list)
-
-            returns:   list of entities
-        """
-        # Base cases        
-        if (item is None) or (type(item) in [int, float]): # remove None + numbers
-            return []
-        if isinstance(item, str):
-            if len(item) == 0 or item.startswith("http"):  # remove empty string + URIs
-                return []
-            else:
-                return [item]
-
-        # Go further down the rabbit-hole
-        values = []
-        if isinstance(item, list):
-            for subdct in item:
-                values += self.__get_entities__(subdct)
-        elif isinstance(item, dict):
-            for key, subdct in item.items():
-                values += self.__get_entities__(subdct)
-        return values
-
-    def __score__(self, tokens):
-        """ Scores a list of token string based on their estimated frequency
-            in dialogue.
-
-            params:
-            list tokens: a list of token strings
-
-            returns:     a score between 0 and 1
-        """
-        # Decompound and discard stopwords
-        tokens = "-".join(tokens).split("-")
-        tokens = [t for t in tokens if t not in self.__stopwords]
-
-        # Return total likelihood of tokens
-        return np.prod([self.__word_probs[t] if t in self.__word_probs else 0 for t in tokens] + [1])
-        
-    def choose(self, thoughts, rank=0):
-        """ Takes a list of thoughts and selects the one most specific according to WordNet.
-
-            params
-            list thoughts: list of Thought dicts
-            int rank:      which rank to select (e.g. i=1)
-
-            returns:       Thought dict
-        """    
-        # Score Thought w.r.t. the entities/predicates mentioned
-        thoughts = [(thought, self.__get_entities__(thought)) for thought in thoughts]
-
-        # Return maximum likelihood Thought
-        thought, _ = sorted(thoughts, key=lambda x: -self.__score__(x[1]))[rank]
-        return thought
-
+from cltl.reply_generation.RL import UCB
 
     
-class ThoughtReplier(BasicReplier):
-    def __init__(self):
-        # type: () -> None
-        """
-        Generate natural language based on structured data
+class RLReplier(BasicReplier):
+    def __init__(self, brain):
+        """ Creates an RL-based replier used to respond to questions and statements
+            by the user. Statements are replied to by phrasing a thought. Selectors
+            for the thought type and instance are learnt using UCB defined in RL.py.
 
-        Parameters
-        ----------
-        """
-        super(ThoughtReplier, self).__init__()
+            params
+            object brain: the brain of Leolani
 
+            returns: None
+        """
+        super(RLReplier, self).__init__()
+        self.__brain = brain
+        self.__thought_type_selector = UCB()
+        self.__thought_inst_selector = UCB()
+        self.__last_thought = None
+
+    @property
+    def thought_types(self):
+        return self.__thought_type_selector
+
+    @property
+    def thought_instances(self):
+        return self.__thought_inst_selector
+
+    def reward_thought(self, reward):
+        """ Updates the thought type and thought instance selectors by rewarding
+            the last of its selected thoughts using a numeric reward.
+
+            params:
+            float reward: reward obtained after thought
+
+            returns: None
+        """
+        if self.__last_thought is not None:
+            # THOUGHT TYPE
+            self.__thought_type_selector.update_utility(self.__last_thought[0], reward)
+            print("\nREWARD %s WITH %s" % (self.__last_thought[0], reward))
+
+            # THOUGHT INSTANCE
+            self.__thought_inst_selector.update_utility(self.__last_thought[1], reward)
+            print("\nREWARD %s WITH %s" % (self.__last_thought[1], reward))
+
+    def reply_to_statement(self, brain_response):
+        """ Selects a Thought from the brain response. First, a high-level thought-type
+            is selected using the thought-type selector. Individual thoughts (at the
+            instance-level) are then selected within the individual _phrase routines.
+            
+            params
+            dict brain_response: brain response from brain.update() converted to JSON
+
+            returns: a string representing a verbalized thought
+        """
+        # Select thought-type from available types
+        thought_types = thought_types_from_brain(brain_response)
+        thought_type = self.__thought_type_selector.select_action(thought_types)
+        print("\nTHOUGHT %s" % thought_type)
+
+        # Preprocess statement (triples) and thoughts
+        utterance = casefold_capsule(brain_response['statement'], format='natural')
+        thoughts = casefold_capsule(brain_response['thoughts'], format='natural')
+
+        # Select reply given selected thought-type
+        say = None
+        if thought_type == 'entity_similarity': # NEW
+            thought_inst, say = self._phrase_entity_similarity(thoughts['_entity_similarity'], utterance)
+            
+        if thought_type == 'complement_conflict':
+            thought_inst, say = self._phrase_cardinality_conflicts(thoughts['_complement_conflict'], utterance)
+
+        elif thought_type == 'negation_conflicts':
+            thought_inst, say = self._phrase_negation_conflicts(thoughts['_negation_conflicts'], utterance)
+
+        elif thought_type == 'statement_novelty':
+            thought_inst, say = self._phrase_statement_novelty(thoughts['_statement_novelty'], utterance)
+
+        elif thought_type == 'entity_novelty':
+            thought_inst, say = self._phrase_entity_novelty(thoughts['_entity_novelty'], utterance)
+
+        elif thought_type == 'object_gaps':
+            thought_inst, say = self._phrase_complement_gaps(thoughts['_complement_gaps'], utterance)
+
+        elif thought_type == 'subject_gaps':
+            thought_inst, say = self._phrase_subject_gaps(thoughts['_subject_gaps'], utterance)
+
+        elif thought_type == 'overlaps':
+            thought_inst, say = self._phrase_overlaps(thoughts['_overlaps'], utterance)
+
+        elif thought_type == 'trust':
+            thought_inst, say = self._phrase_trust(thoughts['_trust'])
+
+        # Fallback strategy
+        if say is None:
+            thought_inst, say = self._phrase_fallback()
+
+        # Update the last thought of the replier
+        self.__last_thought = (thought_type, thought_inst)
+
+        say = say.replace('-', ' ').replace('  ', ' ')
+        return say
+
+    def _phrase_entity_similarity(self, novelty, utterance):
+        """ Phrases an entity similarity thought asking whether some entity is
+            similar than thr one mentioned.
+
+            params:
+            dict novelty:    thought
+            dict utterance:  an utterance
+
+            returns: (thought instance, phrase)
+        """
+        # Get all known entities in the brain and their types
+        entities = self.__brain.get_labels_and_classes()
+
+        # If new subject, compare subject; object otherwise
+        if novelty["_subject"] == 'true':
+            subject = utterance['triple']['_subject']['_label']
+            types = utterance['triple']['_subject']['_types']    
+        else:
+            subject = utterance['triple']['_complement']['_label']
+            types = utterance['triple']['_complement']['_types']
+
+        # Limit entities to the same type and discard subject
+        entities = [ent for ent, type_ in entities.items() if type_ in types and ent != subject]
+        if entities == []:
+            entities = ['object'] # fallback
+
+        # Select new object
+        object_ = thought = self.__thought_inst_selector.select_action(entities)
+
+        # Phrase thought
+        say = "Is a %s similar to a %s?" % (singularize(subject), singularize(object_))
+        return thought, say
+
+    def _phrase_cardinality_conflicts(self, conflicts, utterance):
+        """ Phrases a cardinality conflict thought.
+
+            params:
+            dict conflicts: thoughts 
+            dict utterance: an utterance
+
+            returns: (thought instance, phrase)
+        """
+        say = random.choice(CONFLICTING_KNOWLEDGE)
+        conflict = random.choice(conflicts)
+        x = 'you' if conflict['_provenance']['_author'] == utterance['author'] \
+            else conflict['_provenance']['_author']
+        y = 'you' if utterance['triple']['_subject']['_label'] == conflict['_provenance']['_author'] \
+            else utterance['triple']['_subject']['_label']
+
+        # Checked
+        say += ' %s told me in %s that %s %s %s, but now you tell me that %s %s %s' \
+               % (x, conflict['_provenance']['_date'], y, utterance['triple']['_predicate']['_label'],
+                  conflict['_complement']['_label'],
+                  y, utterance['triple']['_predicate']['_label'], utterance['triple']['_complement']['_label'])
+
+        # Symbolic selection (no need to select here)
+        thought = self.__thought_inst_selector.select_action(['_'])
+        return thought, say
+
+    def _phrase_negation_conflicts(self, conflicts, utterance):
+        """ Phrases a negation conflict thought.
+
+            params:
+            dict conflicts: thoughts 
+            dict utterance: an utterance
+            
+            returns: (thought instance, phrase)
+        """
+        # Separate positive and negative polarities
+        affirmative_conflict = [item for item in conflicts if item['_polarity_value'] == 'POSITIVE']
+        negative_conflict = [item for item in conflicts if item['_polarity_value'] == 'NEGATIVE']
+
+        # There is a conflict, so we phrase it
+        if affirmative_conflict and negative_conflict:
+            say = random.choice(CONFLICTING_KNOWLEDGE)
+
+            affirmative_conflict = random.choice(affirmative_conflict)
+            negative_conflict = random.choice(negative_conflict)
+
+            say += ' %s told me in %s that %s %s %s, but in %s %s told me that %s did not %s %s' \
+                   % (affirmative_conflict['_provenance']['_author'], affirmative_conflict['_provenance']['_date'],
+                      utterance['triple']['_subject']['_label'], utterance['triple']['_predicate']['_label'],
+                      utterance['triple']['_complement']['_label'],
+                      negative_conflict['_provenance']['_date'], negative_conflict['_provenance']['_author'],
+                      utterance['triple']['_subject']['_label'], utterance['triple']['_predicate']['_label'],
+                      utterance['triple']['_complement']['_label'])
+
+        # Symbolic selection (no need to select here)
+        thought = self.__thought_inst_selector.select_action(['_'])        
+        return thought, say
+
+    def _phrase_statement_novelty(self, novelties, utterance):
+        """ Phrases a statement novelty thought.
+
+            params:
+            dict novelties: thoughts 
+            dict utterance: an utterance
+            
+            returns: (thought instance, phrase)
+        """        
+        if not novelties:
+            entity_role = random.choice(['subject', 'object'])
+
+            say = random.choice(NEW_KNOWLEDGE)
+
+            if entity_role == 'subject':
+                if 'person' in ' or '.join(utterance['triple']['_complement']['_types']):
+                    any_type = 'anybody'
+                elif 'location' in ' or '.join(utterance['triple']['_complement']['_types']):
+                    any_type = 'anywhere'
+                else:
+                    any_type = 'anything'
+
+                # Checked
+                say += ' I did not know %s that %s %s' % (any_type, utterance['triple']['_subject']['_label'],
+                                                          utterance['triple']['_predicate']['_label'])
+
+            elif entity_role == 'object':
+                # Checked
+                say += ' I did not know anybody who %s %s' % (utterance['triple']['_predicate']['_label'],
+                                                              utterance['triple']['_complement']['_label'])
+
+        # I already knew this
+        else:
+            say = random.choice(EXISTING_KNOWLEDGE)
+            novelty = random.choice(novelties)
+
+            # Checked
+            say += ' %s told me about it in %s' % (novelty['_provenance']['_author'],
+                                                   novelty['_provenance']['_date'])
+
+        # Symbolic selection (no need to select here)
+        thought = self.__thought_inst_selector.select_action(['_'])
+        return thought, say
+
+    def _phrase_entity_novelty(self, novelties, utterance):
+        """ Phrases an entity novelty thought.
+
+            params:
+            dict novelties: thoughts 
+            dict utterance: an utterance
+            
+            returns: (thought instance, phrase)
+        """   
+        entity_role = random.choice(['subject', 'object'])
+        entity_label = utterance['triple']['_subject']['_label'] \
+            if entity_role == 'subject' else utterance['triple']['_complement']['_label']
+        novelty = novelties['_subject'] if entity_role == 'subject' else novelties['_complement']
+
+        if novelty:
+            entity_label = self._replace_pronouns(utterance['author'], entity_label=entity_label,
+                                                  role=entity_role)
+            say = random.choice(NEW_KNOWLEDGE)
+            if entity_label != 'you':  # TODO or type person?
+                # Checked
+                say += ' I had never heard about %s before!' % self._replace_pronouns(utterance['author'],
+                                                                                      entity_label=entity_label,
+                                                                                      role='object')
+            else:
+                say += ' I am excited to get to know about %s!' % entity_label
+
+        else:
+            say = random.choice(EXISTING_KNOWLEDGE)
+            if entity_label != 'you':
+                # Checked
+                say += ' I have heard about %s before' % self._replace_pronouns(utterance['author'],
+                                                                                entity_label=entity_label,
+                                                                                role='object')
+            else:
+                say += ' I love learning more and more about %s!' % entity_label
+
+        # Symbolic selection (no need to select here)
+        thought = self.__thought_inst_selector.select_action(['_'])        
+        return thought, say
+
+    def _phrase_subject_gaps(self, all_gaps, utterance):
+        """ Phrases a subject gap thought.
+
+            params:
+            dict all_gaps:  thoughts 
+            dict utterance: an utterance
+            
+            returns: (thought instance, phrase)
+        """
+        # Define function to construct a description from overlaps
+        def describe(gap):
+            return gap['_predicate']['_label'] + '_' + gap['_entity']['_types'][0]
+
+        # Select object or subject to pursue
+        entity_role = random.choice(['subject', 'object'])
+        gaps = all_gaps['_subject'] if entity_role == 'subject' else all_gaps['_complement']
+
+        thought = None
+        say = random.choice(CURIOSITY)
+        
+        if entity_role == 'subject':
+
+            if not gaps:               
+                say += ' What types can %s %s' % (utterance['triple']['_subject']['_label'],
+                                                  utterance['triple']['_predicate']['_label'])
+            else:
+                # Select gap to phrase
+                gap_names = {describe(gap):gap for gap in gaps}
+                thought = self.__thought_inst_selector.select_action(gap_names.keys())
+                gap = gap_names[thought]
+                
+                if 'is ' in gap['_predicate']['_label'] or ' is' in gap['_predicate']['_label']:
+                    say += ' Is there a %s that %s %s?' % (' or'.join(gap['_entity']['_types']),
+                                                           gap['_predicate']['_label'],
+                                                           utterance['triple']['_subject']['_label'])
+                elif ' of' in gap['_predicate']['_label']:
+                    say += ' Is there a %s that %s is %s?' % (' or'.join(gap['_entity']['_types']),
+                                                              utterance['triple']['_subject']['_label'],
+                                                              gap['_predicate']['_label'])
+
+                elif ' ' in gap['_predicate']['_label']:
+                    say += ' Is there a %s that is %s %s?' % (' or'.join(gap['_entity']['_types']),
+                                                              gap['_predicate']['_label'],
+                                                              utterance['triple']['_subject']['_label'])
+                else:
+                    # Checked
+                    say += ' Has %s %s %s?' % (utterance['triple']['_subject']['_label'],
+                                               gap['_predicate']['_label'],
+                                               ' or'.join(gap['_entity']['_types']))
+        else:
+            if not gaps:
+                say += ' What kinds of things can %s a %s like %s' % (utterance['triple']['_predicate']['_label'],
+                                                                      utterance['triple']['_complement']['_label'],
+                                                                      utterance['triple']['_subject']['_label'])
+            else:
+                # Select gap to phrase
+                gap_names = {describe(gap):gap for gap in gaps}
+                thought = self.__thought_inst_selector.select_action(gap_names.keys())
+                gap = gap_names[thought]
+                
+                if '#' in ' or'.join(gap['_entity']['_types']):
+                    say += ' What is %s %s?' % (utterance['triple']['_subject']['_label'],
+                                                gap['_predicate']['_label'])
+                elif ' ' in gap['_predicate']['_label']:
+                    # Checked
+                    say += ' Has %s ever %s %s?' % (' or'.join(gap['_entity']['_types']),
+                                                    gap['_predicate']['_label'],
+                                                    utterance['triple']['_subject']['_label'])
+
+                else:
+                    # Checked
+                    say += ' Has %s ever %s a %s?' % (utterance['triple']['_subject']['_label'],
+                                                      gap['_predicate']['_label'],
+                                                      ' or'.join(gap['_entity']['_types']))
+        # Symbolic selection
+        if thought is None:
+            thought = self.__thought_inst_selector.select_action(['_'])
+        return thought, say
+
+    def _phrase_complement_gaps(self, all_gaps, utterance):
+        """ Phrases a object gap (complement gap) thought.
+
+            params:
+            dict all_gaps:  thoughts 
+            dict utterance: an utterance
+            
+            returns: (thought instance, phrase)
+        """
+        # Define function to construct a description from overlaps
+        def describe(gap):
+            return gap['_predicate']['_label'] + '_' + gap['_entity']['_types'][0]
+
+        # Select object or subject to pursue
+        entity_role = random.choice(['subject', 'object'])
+        gaps = all_gaps['_subject'] if entity_role == 'subject' else all_gaps['_complement']
+
+        thought = None
+        say = random.choice(CURIOSITY)
+        
+        if entity_role == 'subject':
+
+            if not gaps:
+                say += ' What types can %s %s' % (utterance['triple']['_subject']['_label'],
+                                                  utterance['triple']['_predicate']['_label'])
+            else:
+                # Select gap to phrase
+                gap_names = {describe(gap):gap for gap in gaps}
+                thought = self.__thought_inst_selector.select_action(gap_names.keys())
+                gap = gap_names[thought]
+                
+                if ' in' in gap['_predicate']['_label']:  # ' by' in gap['_predicate']['_label']
+                    say += ' Is there a %s %s %s?' % (' or'.join(gap['_entity']['_types']),
+                                                      gap['_predicate']['_label'],
+                                                      utterance['triple']['_complement']['_label'])
+                else:
+                    say += ' Has %s %s by a %s?' % (utterance['triple']['_complement']['_label'],
+                                                    gap['_predicate']['_label'],
+                                                    ' or'.join(gap['_entity']['_types']))
+        else: # object
+            if not gaps:
+                otypes = ' or'.join(utterance['triple']['_complement']['_types']) \
+                    if ' or'.join(utterance['triple']['_complement']['_types']) != '' \
+                    else 'things'
+                stypes = ' or'.join(utterance['triple']['_subject']['_types']) \
+                    if ' or '.join(utterance['triple']['_subject']['_types']) != '' \
+                    else 'actors'
+                say += ' What types of %s like %s do %s usually %s' % (otypes,
+                                                                       utterance['triple']['_complement']['_label'],
+                                                                       stypes,
+                                                                       utterance['triple']['_predicate']['_label'])
+            else:
+                # Select gap to phrase
+                gap_names = {describe(gap):gap for gap in gaps}
+                thought = self.__thought_inst_selector.select_action(gap_names.keys())
+                gap = gap_names[thought]
+                
+                if '#' in ' or'.join(gap['_entity']['_types']):
+                    say += ' What is %s %s?' % (utterance['triple']['_complement']['_label'],
+                                                gap['_predicate']['_label'])
+                elif ' by' in gap['_predicate']['_label']:
+                    say += ' Has %s ever %s a %s?' % (utterance['triple']['_complement']['_label'],
+                                                      gap['_predicate']['_label'],
+                                                      ' or'.join(gap['_entity']['_types']))
+                else:
+                    say += ' Has a %s ever %s %s?' % (' or'.join(gap['_entity']['_types']),
+                                                      gap['_predicate']['_label'],
+                                                      utterance['triple']['_complement']['_label'])
+
+        # Symbolic selection
+        if thought is None:
+            thought = self.__thought_inst_selector.select_action(['_'])
+        return thought, say
+
+    def _phrase_overlaps(self, all_overlaps, entity_role, utterance):
+        """ Phrases the overlap thought.
+
+            params:
+            dict all_overlaps: thoughts
+            str entity_role:   subject or object
+            dict utterance:    an utterance
+            
+            returns: (thought instance, phrase)
+        """
+        # Define function to construct a description from overlaps
+        def describe(tup):
+            return "_".join([x['_entity']['_label'] for x in tup])
+        
+        # Select object or subject whichever is available
+        if all_overlaps['_subject']:
+            entity_role == 'subject'
+            overlaps = all_overlaps['_subject']
+        else:
+            entity_role == 'object'
+            overlaps = all_overlaps['_complement']
+
+        # Phrase overlaps
+        say = random.choice(HAPPY)
+        if len(overlaps) < 2:
+            # Phrase overlap
+            overlaps = {describe([overlap]):overlap for overlap in overlaps}
+            thought = self.__thought_inst_selector.select_action(overlaps.keys())
+            overlap = overlaps[thought]
+
+            if entity_role == 'subject':
+                say += ' Did you know that %s also %s %s' % (utterance['triple']['_subject']['_label'],
+                                                             utterance['triple']['_predicate']['_label'],
+                                                             overlap['_entity']['_label'])
+            else:
+                say += ' Did you know that %s also %s %s' % (overlap['_entity']['_label'],
+                                                             utterance['triple']['_predicate']['_label'],
+                                                             utterance['triple']['_complement']['_label'])
+        else:
+            # Phrase a pair of overlaps
+            overlaps = {describe([o1, o2]):(o1, o2) for o1, o2 in permutations(overlaps, r=2)}
+            thought = self.__thought_inst_selector.select_action(overlaps.keys())
+            sample = overlaps[thought]
+
+            if entity_role == 'subject':
+                say += ' Now I know %s items that %s %s, like %s and %s' % (len(overlaps),
+                                                                            utterance['triple']['_subject']['_label'],
+                                                                            utterance['triple']['_predicate']['_label'],
+                                                                            sample[0]['_entity']['_label'],
+                                                                            sample[1]['_entity']['_label'])
+            else:
+                types = ' or '.join(sample[0]['_entity']['_types']) if sample[0]['_entity']['_types'] else 'things'
+                say += ' Now I know %s %s that %s %s, like %s and %s' % (len(overlaps), types,
+                                                                         utterance['triple']['_predicate']['_label'],
+                                                                         utterance['triple']['_complement']['_label'],
+                                                                         sample[0]['_entity']['_label'],
+                                                                         sample[1]['_entity']['_label'])
+        return thought, say
+
+    def _phrase_trust(self, trust):
+        """ Phrases the trust of the robot w.r.t. the speaker.
+
+            params:
+            str trust: trust value for the speaker
+            
+            returns: (thought instance, phrase)
+        """
+        if float(trust) > 0.75: # bugfix
+            say = random.choice(TRUST)
+        else:
+            say = random.choice(NO_TRUST)
+
+        # Symbolic selection as _phrase_trust is deterministic
+        thought = self.__thought_inst_selector.select_action(['_'])
+        return thought, say
+
+    def _phrase_fallback(self):
+        """ Phrases a fallback utterance when an error has ocurred or no
+            thoughts were generated.
+
+            returns: (thought instance, phrase)
+        """
+        say = "I do not know what to say."
+        thought = "no_choice"
+        return thought, say
+
+
+
+    ## Did not touch!
     def reply_to_question(self, brain_response):
         say = ''
         previous_author = ''
@@ -125,7 +560,7 @@ class ThoughtReplier(BasicReplier):
                 if utterance['object']['type'] is not None else ''
 
             if subject_types and object_types and utterance['predicate']['type']:
-                say += "I know %s usually %s %s, but I do not know this case" % (
+                say += "I know %s usually %s %s, but I do not know for sure" % (
                     utterance['subject']['label'],
                     utterance['predicate']['label'],
                     utterance['object']['label'])
@@ -210,366 +645,10 @@ class ThoughtReplier(BasicReplier):
                 say += subject + ' ' + predicate + ' ' + object
 
             say += ' and '
-
         say = say[:-5]
 
         return say.replace('-', ' ').replace('  ', ' ')
-
-    def reply_to_statement(self, brain_response, thought_type):
-        """
-        Phrases a thought type present in the brain_response.
-
-        params
-        dict brain_response: response after brain update
-        str thought_type:    type of an available thought
-
-        returns
-
-        """
-
-        # Casefold statement, utterance and thought
-        utterance = brain_response['statement']
-        if utterance['triple'] is None:
-            return None
-
-        utterance = casefold_capsule(utterance, format='natural')
-        thoughts = casefold_capsule(brain_response['thoughts'], format='natural')
-
-        # Select reply method given Thought-type selected by RL agent
-        say = None
-        if thought_type == 'complement_conflict':
-            say = self._phrase_cardinality_conflicts(thoughts['_complement_conflict'], utterance)
-
-        elif thought_type == 'negation_conflicts':
-            say = self._phrase_negation_conflicts(thoughts['_negation_conflicts'], utterance)
-
-        elif thought_type == 'statement_novelty':
-            say = self._phrase_statement_novelty(thoughts['_statement_novelty'], utterance)
-
-        elif thought_type == 'entity_novelty':
-            say = self._phrase_type_novelty(thoughts['_entity_novelty'], utterance)
-
-        elif thought_type == 'object_gaps':
-            say = self._phrase_complement_gaps(thoughts['_complement_gaps'], utterance)
-
-        elif thought_type == 'subject_gaps':
-            say = self._phrase_subject_gaps(thoughts['_subject_gaps'], utterance)
-
-        elif thought_type == 'overlaps':
-            say = self._phrase_overlaps(thoughts['_overlaps'], utterance)
-
-        elif thought_type == 'trust':
-            say = self._phrase_trust(thoughts['_trust'])
-
-        if say and '-' in say:
-            say = say.replace('-', ' ').replace('  ', ' ')
-
-        return say
-
-
-    @staticmethod
-    def _phrase_cardinality_conflicts(conflicts, utterance):
-        # type: (list[dict], dict) -> str
-
-        # There is no conflict, so nothing
-        if not conflicts:
-            say = None
-
-        # There is a conflict, so we phrase it
-        else:
-            say = random.choice(CONFLICTING_KNOWLEDGE)
-            conflict = ThoughtSelector().choose(conflicts)
-            x = 'you' if conflict['_provenance']['_author'] == utterance['author'] \
-                else conflict['_provenance']['_author']
-            y = 'you' if utterance['triple']['_subject']['_label'] == conflict['_provenance']['_author'] \
-                else utterance['triple']['_subject']['_label']
-
-            # Checked
-            say += ' %s told me in %s that %s %s %s, but now you tell me that %s %s %s' \
-                   % (x, conflict['_provenance']['_date'], y, utterance['triple']['_predicate']['_label'],
-                      conflict['_complement']['_label'],
-                      y, utterance['triple']['_predicate']['_label'], utterance['triple']['_complement']['_label'])
-
-        return say
-
-    @staticmethod
-    def _phrase_negation_conflicts(conflicts, utterance):
-        # type: (list[dict], dict) -> str
-
-        say = None
-
-        # There is conflict entries
-        if conflicts and conflicts[0]:
-            affirmative_conflict = [item for item in conflicts if item['_polarity_value'] == 'POSITIVE']
-            negative_conflict = [item for item in conflicts if item['_polarity_value'] == 'NEGATIVE']
-
-            # There is a conflict, so we phrase it
-            if affirmative_conflict and negative_conflict:
-                say = random.choice(CONFLICTING_KNOWLEDGE)
-
-                affirmative_conflict = ThoughtSelector().choose(affirmative_conflict)
-                negative_conflict = ThoughtSelector().choose(negative_conflict)
-
-                say += ' %s told me in %s that %s %s %s, but in %s %s told me that %s did not %s %s' \
-                       % (affirmative_conflict['_provenance']['_author'], affirmative_conflict['_provenance']['_date'],
-                          utterance['triple']['_subject']['_label'], utterance['triple']['_predicate']['_label'],
-                          utterance['triple']['_complement']['_label'],
-                          negative_conflict['_provenance']['_date'], negative_conflict['_provenance']['_author'],
-                          utterance['triple']['_subject']['_label'], utterance['triple']['_predicate']['_label'],
-                          utterance['triple']['_complement']['_label'])
-
-        return say
-
-    @staticmethod
-    def _phrase_statement_novelty(novelties, utterance):
-        # type: (list[dict], dict) -> str
-        entity_role = random.choice(['subject', 'object'])
-
-        # I do not know this before, so be happy to learn
-        if not novelties:
-            say = random.choice(NEW_KNOWLEDGE)
-
-            if entity_role == 'subject':
-                if 'person' in ' or '.join(utterance['triple']['_complement']['_types']):
-                    any_type = 'anybody'
-                elif 'location' in ' or '.join(utterance['triple']['_complement']['_types']):
-                    any_type = 'anywhere'
-                else:
-                    any_type = 'anything'
-
-                # Checked
-                say += ' I did not know %s that %s %s' % (any_type, utterance['triple']['_subject']['_label'],
-                                                          utterance['triple']['_predicate']['_label'])
-
-            elif entity_role == 'object':
-                # Checked
-                say += ' I did not know anybody who %s %s' % (utterance['triple']['_predicate']['_label'],
-                                                              utterance['triple']['_complement']['_label'])
-
-        # I already knew this
-        else:
-            say = random.choice(EXISTING_KNOWLEDGE)
-            novelty = ThoughtSelector().choose(novelties)
-
-            # Checked
-            say += ' %s told me about it in %s' % (novelty['_provenance']['_author'],
-                                                   novelty['_provenance']['_date'])
-
-        return say
-
-    def _phrase_type_novelty(self, novelties, utterance):
-        # type: (dict, dict) -> str
-        entity_role = random.choice(['subject', 'object'])
-
-        entity_label = utterance['triple']['_subject']['_label'] \
-            if entity_role == 'subject' else utterance['triple']['_complement']['_label']
-        novelty = novelties['_subject'] if entity_role == 'subject' else novelties['_complement']
-
-        if novelty:
-            entity_label = self._replace_pronouns(utterance['author'], entity_label=entity_label, role=entity_role)
-            
-            say = random.choice(NEW_KNOWLEDGE)
-            if entity_label != 'you':  # TODO or type person?
-                # Checked
-                say += ' I had never heard about %s before!' % self._replace_pronouns(utterance['author'],
-                                                                                      entity_label=entity_label,
-                                                                                      role='object')
-            else:
-                say += ' I am excited to get to know about %s!' % entity_label
-
-        else:
-            say = random.choice(EXISTING_KNOWLEDGE)
-            if entity_label != 'you':
-                # Checked
-                say += ' I have heard about %s before' % self._replace_pronouns(utterance['author'],
-                                                                                entity_label=entity_label,
-                                                                                role='object')
-            else:
-                say += ' I love learning more and more about %s!' % entity_label
-
-        return say
-
-    @staticmethod
-    def _phrase_subject_gaps(all_gaps, utterance):
-        # type: (dict, dict) -> str
-        entity_role = random.choice(['subject', 'object'])
-
-        gaps = all_gaps['_subject'] if entity_role == 'subject' else all_gaps['_complement']
-        say = None
-
-        if entity_role == 'subject':
-            say = random.choice(CURIOSITY)
-
-            if not gaps:
-                say += ' What types can %s %s' % (utterance['triple']['_subject']['_label'],
-                                                  utterance['triple']['_predicate']['_label'])
-
-            else:
-                gap = ThoughtSelector().choose(gaps)
-                if 'is ' in gap['_predicate']['_label'] or ' is' in gap['_predicate']['_label']:
-                    say += ' Is there a %s that %s %s?' % (' or'.join(gap['_entity']['_types']),
-                                                           gap['_predicate']['_label'],
-                                                           utterance['triple']['_subject']['_label'])
-                elif ' of' in gap['_predicate']['_label']:
-                    say += ' Is there a %s that %s is %s?' % (' or'.join(gap['_entity']['_types']),
-                                                              utterance['triple']['_subject']['_label'],
-                                                              gap['_predicate']['_label'])
-
-                elif ' ' in gap['_predicate']['_label']:
-                    say += ' Is there a %s that is %s %s?' % (' or'.join(gap['_entity']['_types']),
-                                                              gap['_predicate']['_label'],
-                                                              utterance['triple']['_subject']['_label'])
-                else:
-                    # Checked
-                    say += ' Has %s %s %s?' % (utterance['triple']['_subject']['_label'],
-                                               gap['_predicate']['_label'],
-                                               ' or'.join(gap['_entity']['_types']))
-
-        elif entity_role == 'object':
-            say = random.choice(CURIOSITY)
-
-            if not gaps:
-                say += ' What kinds of things can %s a %s like %s' % (utterance['triple']['_predicate']['_label'],
-                                                                      utterance['triple']['_complement']['_label'],
-                                                                      utterance['triple']['_subject']['_label'])
-
-            else:
-                gap = ThoughtSelector().choose(gaps)
-                if '#' in ' or'.join(gap['_entity']['_types']):
-                    say += ' What is %s %s?' % (utterance['triple']['_subject']['_label'],
-                                                gap['_predicate']['_label'])
-                elif ' ' in gap['_predicate']['_label']:
-                    # Checked
-                    say += ' Has %s ever %s %s?' % (' or'.join(gap['_entity']['_types']),
-                                                    gap['_predicate']['_label'],
-                                                    utterance['triple']['_subject']['_label'])
-
-                else:
-                    # Checked
-                    say += ' Has %s ever %s a %s?' % (utterance['triple']['_subject']['_label'],
-                                                      gap['_predicate']['_label'],
-                                                      ' or'.join(gap['_entity']['_types']))
-
-        return say
-
-    @staticmethod
-    def _phrase_complement_gaps(all_gaps, utterance):
-        # type: (dict, dict) -> str
-        entity_role = random.choice(['subject', 'object'])
-
-        gaps = all_gaps['_subject'] if entity_role == 'subject' else all_gaps['_complement']
-        say = None
-
-        if entity_role == 'subject':
-            say = random.choice(CURIOSITY)
-
-            if not gaps:
-                # Checked
-                say += ' What types can %s %s' % (utterance['triple']['_subject']['_label'],
-                                                  utterance['triple']['_predicate']['_label'])
-
-            else:
-                gap = ThoughtSelector().choose(gaps)
-                if ' in' in gap['_predicate']['_label']:  # ' by' in gap['_predicate']['_label']
-                    say += ' Is there a %s %s %s?' % (' or'.join(gap['_entity']['_types']),
-                                                      gap['_predicate']['_label'],
-                                                      utterance['triple']['_complement']['_label'])
-                else:
-                    say += ' Has %s %s by a %s?' % (utterance['triple']['_complement']['_label'],
-                                                    gap['_predicate']['_label'],
-                                                    ' or'.join(gap['_entity']['_types']))
-
-        elif entity_role == 'object':
-            say = random.choice(CURIOSITY)
-
-            if not gaps:
-                otypes = ' or'.join(utterance['triple']['_complement']['_types']) \
-                    if ' or'.join(utterance['triple']['_complement']['_types']) != '' \
-                    else 'things'
-                stypes = ' or'.join(utterance['triple']['_subject']['_types']) \
-                    if ' or '.join(utterance['triple']['_subject']['_types']) != '' \
-                    else 'actors'
-                say += ' What types of %s like %s do %s usually %s' % (otypes,
-                                                                       utterance['triple']['_complement']['_label'],
-                                                                       stypes,
-                                                                       utterance['triple']['_predicate']['_label'])
-            else:
-                gap = ThoughtSelector().choose(gaps)
-                if '#' in ' or'.join(gap['_entity']['_types']):
-                    say += ' What is %s %s?' % (utterance['triple']['_complement']['_label'],
-                                                gap['_predicate']['_label'])
-                elif ' by' in gap['_predicate']['_label']:
-                    say += ' Has %s ever %s a %s?' % (utterance['triple']['_complement']['_label'],
-                                                      gap['_predicate']['_label'],
-                                                      ' or'.join(gap['_entity']['_types']))
-                else:
-                    say += ' Has a %s ever %s %s?' % (' or'.join(gap['_entity']['_types']),
-                                                      gap['_predicate']['_label'],
-                                                      utterance['triple']['_complement']['_label'])
-
-        return say
-
-    @staticmethod
-    def _phrase_overlaps(all_overlaps, utterance):
-        # type: (dict, dict) -> str
-        entity_role = random.choice(['subject', 'object'])
-
-        overlaps = all_overlaps['_subject'] if entity_role == 'subject' else all_overlaps['_complement']
-        say = None
-
-        if not overlaps:
-            say = None
-
-        elif len(overlaps) < 2 and entity_role == 'subject':
-            say = random.choice(HAPPY)
-
-            say += ' Did you know that %s also %s %s' % (utterance['triple']['_subject']['_label'],
-                                                         utterance['triple']['_predicate']['_label'],
-                                                         random.choice(overlaps)['_entity']['_label'])
-
-        elif len(overlaps) < 2 and entity_role == 'object':
-            say = random.choice(HAPPY)
-
-            say += ' Did you know that %s also %s %s' % (random.choice(overlaps)['_entity']['_label'],
-                                                         utterance['triple']['_predicate']['_label'],
-                                                         utterance['triple']['_complement']['_label'])
-
-        elif entity_role == 'subject':
-            say = random.choice(HAPPY)
-            sample = [ThoughtSelector().choose(overlaps),
-                      ThoughtSelector().choose(overlaps, rank=1)] # no duplicates :)
-
-            entity_0 = sample[0]['_entity']['_label']
-            entity_1 = sample[1]['_entity']['_label']
-
-            say += ' Now I know %s items that %s %s, like %s and %s' % (len(overlaps),
-                                                                        utterance['triple']['_subject']['_label'],
-                                                                        utterance['triple']['_predicate']['_label'],
-                                                                        entity_0, entity_1)
-
-        elif entity_role == 'object':
-            say = random.choice(HAPPY)
-            sample = [ThoughtSelector().choose(overlaps),
-                      ThoughtSelector().choose(overlaps, rank=1)] # no duplicates :)
-            types = ' or '.join(sample[0]['_entity']['_types']) if sample[0]['_entity']['_types'] else 'things'
-            say += ' Now I know %s %s that %s %s, like %s and %s' % (len(overlaps), types,
-                                                                     utterance['triple']['_predicate']['_label'],
-                                                                     utterance['triple']['_complement']['_label'],
-                                                                     sample[0]['_entity']['_label'],
-                                                                     sample[1]['_entity']['_label'])
-
-        return say
-
-    @staticmethod
-    def _phrase_trust(trust):
-        # type: (float) -> str
-
-        if float(trust) > 0.75:
-            say = random.choice(TRUST)
-        else:
-            say = random.choice(NO_TRUST)
-
-        return say
+    
 
     @staticmethod
     def _assign_spo(utterance, item):
