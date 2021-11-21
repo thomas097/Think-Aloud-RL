@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import pprint
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +18,50 @@ wnl = WordNetLemmatizer()
 
 ROOT = os.path.join(os.path.dirname(__file__), '..')
 lexicon = json.load(open(os.path.join(ROOT, 'data', 'lexicon.json')))
+
+
+def thought_types_from_brain(brain_response):
+    """ Takes a brain response capsule and extracts a list of thought types from it.
+
+        params
+        dict capsule: dict containing the input utterance, triples, perspectives
+                      and contextual information (e.g. location, speaker)
+
+        returns:      a list of Thought types
+    """
+    th = brain_response['thoughts']
+
+    # Can always be calculated
+    thoughts = ['trust', 'statement_novelty']
+
+    # Any subject/object overlaps?
+    thoughts += ['overlaps'] if th['_overlaps']['_subject'] else []
+    thoughts += ['overlaps'] if th['_overlaps']['_complement'] else []
+
+    # Any entity novelties?
+    thoughts += ['entity_novelty'] if th['_entity_novelty']['_complement'] == 'True' else []
+    thoughts += ['entity_novelty'] if th['_entity_novelty']['_subject'] == 'True' else []
+
+    # Any novelty similarities? (NEW)
+    thoughts += ['entity_similarity'] if th['_entity_similarity']['_complement'] == 'True' else []
+    thoughts += ['entity_similarity'] if th['_entity_similarity']['_subject'] == 'True' else []
+
+    # Any subject gaps?
+    thoughts += ['subject_gaps'] if th['_subject_gaps']['_complement'] else []
+    thoughts += ['subject_gaps'] if th['_subject_gaps']['_subject'] else []
+
+    # Any object gaps?
+    thoughts += ['object_gaps'] if th['_complement_gaps']['_complement'] else []
+    thoughts += ['object_gaps'] if th['_complement_gaps']['_subject'] else []
+
+    # Any complement conflicts (cardinality conflict)?
+    thoughts += ['complement_conflict'] if th['_complement_conflict'] else []
+
+    # Any negation conflicts?
+    polarities = [item['_polarity_value'] for item in th['_negation_conflicts']]
+    thoughts += ['negation_conflicts'] if 'POSITIVE' in polarities and 'NEGATIVE' in polarities else []
+
+    return set(thoughts)
 
 
 def trim_dash(triple):
