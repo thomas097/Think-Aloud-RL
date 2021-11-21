@@ -3,47 +3,6 @@ import random
 import numpy as np
 
 
-def thought_types_from_brain(brain_response):
-    """ Takes a Brain response capsule and extracts the types of generated
-        thoughts from it.
-
-        params
-        dict capsule: JSON containing the input utterance, extracted triples,
-                      the perspective and contextual information
-
-        returns:      a list of Thought types
-    """
-    t = brain_response['thoughts']
-
-    thoughts = []
-    if len(t['_overlaps']):
-        overlaps = t['_overlaps']
-        thoughts += ['overlaps'] if len(overlaps['_complement']) else []
-        thoughts += ['overlaps'] if len(overlaps['_subject']) else []
-
-    if len(t['_entity_novelty']):
-        entity_novelty = t['_entity_novelty']
-        thoughts += ['entity_novelty'] if entity_novelty['_complement'] else []  
-        thoughts += ['entity_novelty'] if entity_novelty['_subject'] else []
-
-    if len(t['_subject_gaps']):
-        subject_gaps = t['_subject_gaps']
-        thoughts += ['subject_gaps'] if len(subject_gaps['_complement']) else []           
-        thoughts += ['subject_gaps'] if len(subject_gaps['_subject']) else []
-
-    if len(t['_complement_gaps']):
-        object_gaps = t['_complement_gaps']
-        thoughts += ['object_gaps'] if len(object_gaps['_complement']) else []           
-        thoughts += ['object_gaps'] if len(object_gaps['_subject']) else []
-
-    if len(t['_statement_novelty']):
-        thoughts += ['statement_novelty', 'statement_novelty']
-    
-    thoughts += ['complement_conflict'] if len(t['_complement_conflict']) else []
-    thoughts += ['negation_conflicts'] if len(t['_negation_conflicts']) else []
-    thoughts += ['trust']
-    return set(thoughts)
-
 def capsule_for_query(capsule):
     """ Casefolds the triple in a capsule so that its entities all match regardless of case.
 
